@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
@@ -81,7 +82,7 @@ fn process_is_alive(_pid: u32) -> bool {
 /// or when it is older than [`STALE_TEMP_INDEX_MAX_AGE`].
 ///
 /// Best-effort, like [`crate::cache::sweep_lru`]: every error is logged at
-/// debug and ignored, because the next `temp_index()` sweeps again. A file
+/// debug and ignored, because the next `wt` invocation sweeps again. A file
 /// that vanishes mid-sweep is the owner's own `Drop` winning the race, which
 /// is the outcome this exists to produce.
 fn sweep_orphaned_temp_indexes(dir: &Path, is_alive: impl Fn(u32) -> bool) {
@@ -105,20 +106,12 @@ fn sweep_orphaned_temp_indexes(dir: &Path, is_alive: impl Fn(u32) -> bool) {
         }
         let path = entry.path();
         match std::fs::remove_file(&path) {
-            Ok(()) => tracing::debug!(
-                path = %path.display(),
-                pid,
-                "temp index: swept orphan from {}",
-                path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::debug!(
-                path = %path.display(),
-                error = %error,
-                "temp index: failed to sweep {}: {}",
-                path.display(),
-                error
-            ),
+            Ok(()) => tracing::debug!(pid, "temp index: swept orphan {}", path.display()),
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!("temp index: failed to sweep {}: {error}", path.display());
+                }
+            }
         }
     }
 }
@@ -1164,7 +1157,13 @@ impl<'a> WorkingTree<'a> {
         let prefix = temp_index_prefix_for(std::process::id());
         let mut builder = tempfile::Builder::new();
         builder.prefix(&prefix);
-        sweep_orphaned_temp_indexes(&std::env::temp_dir(), process_is_alive);
+        // Orphans only come from other processes, so one sweep per process
+        // reclaims them all. `wt list` calls this once per worktree, in
+        // parallel; the first caller sweeps and the rest don't wait on it.
+        static SWEPT_SYSTEM_TEMP: AtomicBool = AtomicBool::new(false);
+        if !SWEPT_SYSTEM_TEMP.swap(true, Ordering::Relaxed) {
+            sweep_orphaned_temp_indexes(&std::env::temp_dir(), process_is_alive);
+        }
         let mut temp_file = match builder.tempfile() {
             Ok(file) => file,
             Err(temp_error) => {
@@ -1559,8 +1558,8 @@ fn run_checked(command: Cmd, args: &[String]) -> anyhow::Result<std::process::Ou
 mod tests {
     use super::has_initialized_submodules_from_status;
     use super::{
-        Duration, Path, STALE_TEMP_INDEX_MAX_AGE, SystemTime, sweep_orphaned_temp_indexes,
-        temp_index_owner_pid, temp_index_prefix_for,
+        Duration, Path, STALE_TEMP_INDEX_MAX_AGE, SystemTime, process_is_alive,
+        sweep_orphaned_temp_indexes, temp_index_owner_pid, temp_index_prefix_for,
     };
     use crate::git::{LineDiff, Repository};
     use crate::shell_exec::Cmd;
@@ -1778,6 +1777,38 @@ mod tests {
         sweep_orphaned_temp_indexes(dir.path(), |_| true);
 
         assert!(!aged.exists(), "an aged orphan goes despite a live PID");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_is_alive_tells_a_live_pid_from_a_reaped_one() {
+        assert!(process_is_alive(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_is_alive(pid), "a reaped child's PID is gone");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_survives_an_orphan_it_cannot_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir
+            .path()
+            .join(format!("{}xxxxxx", temp_index_prefix_for(1)));
+        std::fs::write(&orphan, b"DIRC").unwrap();
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(dir.path(), read_only).unwrap();
+        // Root ignores directory permissions, so nothing would fail.
+        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+            return;
+        }
+
+        sweep_orphaned_temp_indexes(dir.path(), |_| false);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(orphan.exists(), "a failed remove is logged and skipped");
     }
 
     #[test]
