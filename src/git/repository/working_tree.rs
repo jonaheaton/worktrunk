@@ -108,9 +108,7 @@ fn sweep_orphaned_temp_indexes(dir: &Path, is_alive: impl Fn(u32) -> bool) {
         match std::fs::remove_file(&path) {
             Ok(()) => tracing::debug!(pid, "temp index: swept orphan {}", path.display()),
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::debug!("temp index: failed to sweep {}: {error}", path.display());
-                }
+                tracing::debug!("temp index: failed to sweep {}: {error}", path.display());
             }
         }
     }
@@ -1558,8 +1556,8 @@ fn run_checked(command: Cmd, args: &[String]) -> anyhow::Result<std::process::Ou
 mod tests {
     use super::has_initialized_submodules_from_status;
     use super::{
-        Duration, Path, STALE_TEMP_INDEX_MAX_AGE, SystemTime, process_is_alive,
-        sweep_orphaned_temp_indexes, temp_index_owner_pid, temp_index_prefix_for,
+        Duration, Path, STALE_TEMP_INDEX_MAX_AGE, SystemTime, sweep_orphaned_temp_indexes,
+        temp_index_owner_pid, temp_index_prefix_for,
     };
     use crate::git::{LineDiff, Repository};
     use crate::shell_exec::Cmd;
@@ -1782,6 +1780,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn process_is_alive_tells_a_live_pid_from_a_reaped_one() {
+        use super::process_is_alive;
         assert!(process_is_alive(std::process::id()));
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
@@ -1800,15 +1799,16 @@ mod tests {
         std::fs::write(&orphan, b"DIRC").unwrap();
         let read_only = std::fs::Permissions::from_mode(0o555);
         std::fs::set_permissions(dir.path(), read_only).unwrap();
-        // Root ignores directory permissions, so nothing would fail.
-        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
-            return;
-        }
+        // Root ignores directory permissions, so there the remove succeeds.
+        let is_root = std::fs::write(dir.path().join("probe"), b"").is_ok();
 
         sweep_orphaned_temp_indexes(dir.path(), |_| false);
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(orphan.exists(), "a failed remove is logged and skipped");
+        assert!(
+            is_root || orphan.exists(),
+            "a failed remove is logged and skipped"
+        );
     }
 
     #[test]
