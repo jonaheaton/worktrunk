@@ -163,7 +163,7 @@ pub fn handle_alias_dry_run(name: String, args: Vec<String>) -> anyhow::Result<(
     // so a flag binds if any entry's template references it.
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     for (cfg, _) in &entries {
-        referenced.extend(referenced_vars_for_config(cfg, &name)?);
+        referenced.extend(referenced_vars_for_config(cfg, |_| name.clone())?);
     }
     let mut parse_args = Vec::with_capacity(1 + args.len());
     parse_args.push(name.clone());
@@ -251,7 +251,7 @@ fn entries_for_name(
 ) -> Vec<(CommandConfig, HookSource)> {
     let project_id = repo.project_identifier().ok();
     let mut entries = Vec::new();
-    if let Some(cfg) = user_config.aliases(project_id.as_deref()).get(name) {
+    if let Some(cfg) = user_config.aliases(project_id.as_ref()).get(name) {
         entries.push((cfg.clone(), HookSource::User));
     }
     if let Some(pc) = project_config

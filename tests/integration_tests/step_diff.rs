@@ -127,6 +127,75 @@ fn test_step_diff_index_unchanged(mut repo: TestRepo) {
     );
 }
 
+/// Cleanup is wired into index creation in both storage locations.
+#[cfg(unix)]
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_step_diff_sweeps_stale_indexes(repo: TestRepo, #[case] fallback: bool) {
+    let scratch = worktrunk::testing::test_tempdir();
+    let temp_dir = if fallback {
+        scratch.path().join("missing")
+    } else {
+        scratch.path().to_path_buf()
+    };
+    let index_dir = if fallback {
+        repo.root_path().join(".git")
+    } else {
+        temp_dir.clone()
+    };
+    let orphan = index_dir.join("worktrunk-temp-index-AbC123");
+    let file = fs::File::create(&orphan).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    drop(file);
+    // A matching directory cannot be removed as a file; cleanup must continue.
+    let obstacle = index_dir.join("worktrunk-temp-index-directory");
+    fs::create_dir(&obstacle).unwrap();
+    fs::File::open(&obstacle)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    let real_index = repo.root_path().join(".git/index");
+    let before = fs::read(&real_index).unwrap();
+    fs::write(
+        repo.root_path().join("untracked.txt"),
+        "untracked content\n",
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "diff", "--", "--name-only"])
+        .env("TMPDIR", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "untracked.txt"
+    );
+    assert!(!orphan.exists(), "stale index must be reclaimed");
+    assert!(obstacle.is_dir(), "cleanup must not remove directories");
+    assert_eq!(fs::read(real_index).unwrap(), before);
+    assert!(
+        fs::read_dir(index_dir).unwrap().all(|entry| {
+            let entry = entry.unwrap();
+            entry.path() == obstacle
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("worktrunk-temp-index-")
+        }),
+        "normal exit must remove the new index too"
+    );
+}
+
 /// Explicit target branch
 #[rstest]
 fn test_step_diff_explicit_target(mut repo: TestRepo) {

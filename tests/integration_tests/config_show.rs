@@ -99,7 +99,7 @@ fn test_config_show_rejects_invalid_approvals_file(repo: TestRepo) {
 fn test_config_show_hides_fully_approved_commands(repo: TestRepo) {
     repo.write_project_config("pre-start = \"npm install\"\n");
     let project = repo.repo.project_identifier().unwrap();
-    let project = toml::Value::String(project).to_string();
+    let project = toml::Value::String(project.to_string()).to_string();
     fs::write(
         repo.test_approvals_path(),
         format!("[projects.{project}]\napproved-commands = [\"npm install\"]\n"),
@@ -753,16 +753,20 @@ fn test_config_show_zsh_compinit_warning(mut repo: TestRepo, temp_home: TempDir)
     fs::create_dir_all(&global_config_dir).unwrap();
     fs::write(global_config_dir.join("config.toml"), "").unwrap();
 
-    // Create .zshrc WITHOUT compinit - completions won't work
+    // Use a custom zsh config directory so the advisory must name the same
+    // file as the integration detector.
+    let zdotdir = canonical_temp_home(&temp_home).join("zsh-config");
+    fs::create_dir_all(&zdotdir).unwrap();
     fs::write(
-        temp_home.path().join(".zshrc"),
+        zdotdir.join(".zshrc"),
         r#"# wt integration but no compinit!
 if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
 "#,
     )
     .unwrap();
 
-    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    let mut settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.add_redaction(".env.ZDOTDIR", "[TEST_ZDOTDIR]");
     settings.bind(|| {
         let mut cmd = repo.wt_command();
         // Force compinit warning for deterministic tests across environments
@@ -770,6 +774,7 @@ if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)
         cmd.arg("config").arg("show").current_dir(repo.root_path());
         set_temp_home_env(&mut cmd, temp_home.path());
         set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("ZDOTDIR", &zdotdir);
 
         assert_cmd_snapshot!(cmd);
     });
@@ -2199,8 +2204,8 @@ pre-start = "ln -sf {{ repo_root }}/node_modules {{ worktree }}/node_modules"
     );
 }
 
-/// With -v flag, the brief deprecation warning includes the mv command hint
-/// and template expansion logs are shown
+/// With -v flag, template expansion logs appear alongside the deprecation
+/// warnings
 #[rstest]
 fn test_deprecated_template_variables_verbose_shows_content(repo: TestRepo, temp_home: TempDir) {
     // Write config with deprecated variables
@@ -2795,7 +2800,7 @@ fn test_config_show_gemini_extension_installed(mut repo: TestRepo, temp_home: Te
 /// override the harness sets, so the production `which::which` PATH lookup is
 /// otherwise never exercised. `setup_mock_clis_on_path()` drops the overrides
 /// and prepends real mock executables, so this single run covers the
-/// PATH-detection path for all five AI CLIs at once.
+/// PATH-detection path for all six AI CLIs at once.
 #[rstest]
 fn test_config_show_clis_detected_via_path(mut repo: TestRepo, temp_home: TempDir) {
     repo.setup_mock_ci_tools_unauthenticated();
@@ -3092,7 +3097,7 @@ fn test_opencode_install_ignores_relative_xdg_config_home(temp_home: TempDir) {
 }
 
 /// Install prompt declined (no `--yes`, piped stdin → empty → declined).
-/// Exercises the `return Ok(())` branch at lines 83-84 of opencode.rs.
+/// Exercises the declined-prompt branch of `install_file_plugin` in config/mod.rs.
 #[rstest]
 fn test_opencode_install_prompt_declined(temp_home: TempDir) {
     let settings = setup_home_snapshot_settings(&temp_home);
@@ -3115,7 +3120,7 @@ fn test_opencode_install_prompt_declined(temp_home: TempDir) {
 }
 
 /// Uninstall prompt declined (no `--yes`, piped stdin → empty → declined).
-/// Exercises the `return Ok(())` branch at lines 129-130 of opencode.rs.
+/// Exercises the declined-prompt branch of `uninstall_file_plugin` in config/mod.rs.
 #[rstest]
 fn test_opencode_uninstall_prompt_declined(temp_home: TempDir) {
     // Pre-install the plugin so we reach the prompt
@@ -3661,7 +3666,8 @@ fn test_config_show_runs_real_ancestry_walk(mut repo: TestRepo, temp_home: TempD
     );
 }
 
-/// Test that deprecated [commit-generation] section shows warning and creates migration file
+/// Test that deprecated [commit-generation] section shows warning and that
+/// `wt config update` migrates it in place
 #[rstest]
 fn test_deprecated_commit_generation_section_shows_warning(repo: TestRepo, temp_home: TempDir) {
     // Write user config with deprecated [commit-generation] section
@@ -5764,110 +5770,66 @@ fn test_plugin_layout_is_consolidated() {
     }
     assert!(skill_dirs > 0, "skills/ holds no skill directories");
 
-    // The WorktreeRemove hook must not force-delete unmerged branches (#2939).
-    // Claude Code auto-fires WorktreeRemove on session exit for any worktree
-    // with a clean working tree, so a hook command containing `-D` /
-    // `--force-delete` silently discards committed-but-unpushed work — the only
-    // recovery path is `git fsck`. The safe default retains unmerged branches
-    // and prints a `wt remove -D <branch>` hint for the user to act on.
-    let hooks = read("plugins/worktrunk/hooks/hooks.json");
     let hooks_json = json("plugins/worktrunk/hooks/hooks.json");
-
-    // Claude hands each hook command to the user's LOGIN shell before `bash`
-    // launches, so the outer command line must parse under fish/zsh/bash. fish
-    // rejects bash brace syntax ("Variables cannot be bracketed"), so the plugin
-    // root must be referenced as `$CLAUDE_PLUGIN_ROOT`, never `${CLAUDE_PLUGIN_ROOT}`.
-    let all_commands: Vec<&str> = hooks_json["hooks"]
+    let commands: Vec<(&str, &str)> = hooks_json["hooks"]
         .as_object()
         .expect("hooks.json must have a `hooks` object")
-        .values()
-        .flat_map(|event| event.as_array().expect("each hook event must be an array"))
-        .flat_map(|group| {
-            group["hooks"]
+        .iter()
+        .flat_map(|(event, groups)| {
+            groups
                 .as_array()
-                .expect("each hook group must have a `hooks` array")
-        })
-        .map(|hook| {
-            hook["command"]
-                .as_str()
-                .expect("each hook must define a command")
+                .expect("each hook event must be an array")
+                .iter()
+                .flat_map(|group| {
+                    group["hooks"]
+                        .as_array()
+                        .expect("each hook group must have a `hooks` array")
+                })
+                .map(move |hook| {
+                    (
+                        event.as_str(),
+                        hook["command"]
+                            .as_str()
+                            .expect("each hook must define a command"),
+                    )
+                })
         })
         .collect();
-    for cmd in &all_commands {
-        assert!(
-            cmd.contains("$CLAUDE_PLUGIN_ROOT") && !cmd.contains("${CLAUDE_PLUGIN_ROOT}"),
-            "hook command must use unbraced $CLAUDE_PLUGIN_ROOT (braces break fish \
-             login-shell parsing: \"fish: Variables cannot be bracketed\"). command:\n{cmd}"
-        );
-    }
 
-    let marker_commands = all_commands
-        .iter()
-        .filter(|command| command.contains("config state marker"))
-        .collect::<Vec<_>>();
+    // Every hook runs the same literal command: `wt config plugins claude
+    // hook` reads Claude Code's payload and dispatches on the event, so the
+    // behavior lives in `wt` and is tested in `claude_hook.rs`. Anthropic's
+    // plugin directory refuses a hook command whose path the shell computes or
+    // that carries an inline program. The root stays unbraced: Claude hands
+    // each command to the user's login shell before `bash` launches, and fish
+    // rejects `${CLAUDE_PLUGIN_ROOT}` ("Variables cannot be bracketed"). The
+    // marker events end in `|| true`: a `wt` too old to have `hook` exits 2,
+    // which Claude Code reads as blocking the prompt, tool call, permission,
+    // or stop. The worktree events must fail when `wt` does.
+    const HOOK: &str = r#"bash "$CLAUDE_PLUGIN_ROOT/hooks/wt.sh" config plugins claude hook"#;
+    let mut events: Vec<&str> = commands.iter().map(|(event, _)| *event).collect();
+    events.sort_unstable();
     assert_eq!(
-        marker_commands.len(),
-        6,
-        "expected all 6 Claude marker hooks (UserPromptSubmit, Notification, \
-         PreToolUse, PermissionRequest, Stop, SessionEnd); a newly added one \
-         must be pinned too. hooks.json:\n{hooks}"
+        events,
+        [
+            "Notification",
+            "PermissionRequest",
+            "PreToolUse",
+            "SessionEnd",
+            "Stop",
+            "UserPromptSubmit",
+            "WorktreeCreate",
+            "WorktreeRemove",
+        ]
     );
-    for command in marker_commands {
-        assert!(
-            command.contains(r#"-C "$CLAUDE_PROJECT_DIR""#),
-            "marker hook must pin the directory it resolves against, or a shell \
-             `cd` during a turn retargets it to another repository (#3921). \
-             command:\n{command}"
-        );
+    for (event, command) in &commands {
+        let expected = if event.starts_with("Worktree") {
+            HOOK.to_string()
+        } else {
+            format!("{HOOK} || true")
+        };
+        assert_eq!(*command, expected, "{event} hook command drifted");
     }
-    let worktree_remove_cmd = hooks_json["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"]
-        .as_str()
-        .expect("WorktreeRemove hook must define a command");
-    assert!(
-        !worktree_remove_cmd.contains(" -D") && !worktree_remove_cmd.contains("--force-delete"),
-        "WorktreeRemove hook must not pass -D / --force-delete (silently destroys \
-         committed-but-unpushed work on session-exit auto-remove; see #2939). \
-         hooks.json:\n{hooks}"
-    );
-
-    // The WorktreeRemove hook must resolve against the worktree path Claude
-    // Code hands it, not the session's project dir. The `claude agents` view
-    // spans every repo with a background session and is often launched from a
-    // parent directory that merely contains them, so `CLAUDE_PROJECT_DIR` names
-    // the wrong repo or none at all, `wt remove <path>` dies with `fatal: not a
-    // git repository`, and the session row is left undeletable (#3754, after
-    // the #3489 anchor proved insufficient). `-C "$p"` is layout-independent: a
-    // linked worktree carries a `.git` file pointing at its owning repository.
-    assert!(
-        worktree_remove_cmd.contains("-C \"$p\"")
-            && !worktree_remove_cmd.contains("CLAUDE_PROJECT_DIR"),
-        "WorktreeRemove hook must resolve via -C \"$p\" (the worktree path Claude Code \
-         handed it), never CLAUDE_PROJECT_DIR — the agents view is multi-repo, so no \
-         single project dir is correct for every session (#3754). \
-         command:\n{worktree_remove_cmd}"
-    );
-
-    // The WorktreeCreate hook pipes `wt … --format=json | jq -er .path`. Without
-    // `set -o pipefail` the pipeline's exit status is jq's, and `jq -er .path`
-    // on the empty stdout of a failed `wt` exits 0 on jq 1.6 — so a `wt` failure
-    // (e.g. an existing-branch collision after the branch/worktree were already
-    // created) is swallowed and Claude Code reports the misleading "hook
-    // succeeded but returned no worktree path" instead of wt's real error
-    // (#3545). pipefail makes the pipeline surface wt's nonzero exit regardless
-    // of jq version. The wrapper must be `bash -c` (dash rejects `set -o
-    // pipefail` fatally; some login shells are fish, which has no shell options)
-    // — see skills/wt-switch-create/rationale.md, "The hooks.json pipefail wrapper".
-    let worktree_create_cmd = hooks_json["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"]
-        .as_str()
-        .expect("WorktreeCreate hook must define a command");
-    assert!(
-        worktree_create_cmd.contains("set -o pipefail"),
-        "WorktreeCreate hook pipes `wt … | jq -er .path`; without `set -o pipefail` a \
-         failed wt with empty stdout is swallowed (jq 1.6 exits 0 on empty input) and \
-         Claude Code reports \"hook succeeded but returned no worktree path\" instead \
-         of wt's real error (#3545). command:\n{worktree_create_cmd}"
-    );
-
     // The product description must not drift across tools. Byte-identical is
     // schema-impossible (Codex omits the activity clause, Gemini says
     // "extension"), but every manifest shares the canonical opening sentence.
@@ -6365,7 +6327,7 @@ fn test_claude_hook_commands_parse_in_all_shells() {
 /// directions are pinned below — a skeleton is a no-op, a clean worktree is
 /// still removed, a dirty one still fails — so neither a blanket `exit 0` nor a
 /// swallowed `wt remove` failure can satisfy this test. It runs the real command
-/// out of `hooks.json`, which parses its stdin with `jq`.
+/// out of `hooks.json`.
 #[cfg(all(unix, feature = "shell-integration-tests"))]
 #[rstest]
 fn test_worktree_remove_hook_skips_path_holding_no_worktree(mut repo: TestRepo) {
@@ -6390,9 +6352,8 @@ fn test_worktree_remove_hook_skips_path_holding_no_worktree(mut repo: TestRepo) 
 
     // Fire the hook exactly as Claude Code does: the recorded path on stdin, the
     // plugin root in the environment. No `CLAUDE_PROJECT_DIR` — the hook
-    // resolves the repository from the worktree path via `-C "$p"` and must
-    // never consult a project dir (#3754), so setting one here would be dead
-    // setup.
+    // resolves the repository from the worktree path and must never consult a
+    // project dir (#3754), so setting one here would be dead setup.
     let run_hook = |worktree_path: &Path| -> Output {
         let mut cmd = std::process::Command::new("bash");
         repo.configure_wt_cmd(&mut cmd);
@@ -6406,7 +6367,10 @@ fn test_worktree_remove_hook_skips_path_holding_no_worktree(mut repo: TestRepo) 
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn bash");
-        let payload = serde_json::json!({ "worktree_path": worktree_path.to_str().unwrap() });
+        let payload = serde_json::json!({
+            "hook_event_name": "WorktreeRemove",
+            "worktree_path": worktree_path.to_str().unwrap(),
+        });
         child
             .stdin
             .take()
