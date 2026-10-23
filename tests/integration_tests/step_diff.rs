@@ -168,6 +168,7 @@ fn test_step_diff_sweeps_stale_indexes(repo: TestRepo, #[case] fallback: bool) {
         .wt_command()
         .args(["step", "diff", "--", "--name-only"])
         .env("TMPDIR", &temp_dir)
+        .env("RUST_LOG", "debug")
         .output()
         .unwrap();
 
@@ -175,6 +176,13 @@ fn test_step_diff_sweeps_stale_indexes(repo: TestRepo, #[case] fallback: bool) {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "Failed to remove stale temporary index {}:",
+            obstacle.display()
+        )),
+        "cleanup failure should be visible in debug logging"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
@@ -194,6 +202,52 @@ fn test_step_diff_sweeps_stale_indexes(repo: TestRepo, #[case] fallback: bool) {
         }),
         "normal exit must remove the new index too"
     );
+}
+
+/// When neither storage location is writable, diff fails without touching the index.
+#[cfg(unix)]
+#[rstest]
+fn test_step_diff_preserves_index_when_temp_index_creation_fails(repo: TestRepo) {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions<'a>(&'a Path, fs::Permissions);
+    impl Drop for RestorePermissions<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, self.1.clone());
+        }
+    }
+
+    let git_dir = repo.root_path().join(".git");
+    let real_index = git_dir.join("index");
+    let before = fs::read(&real_index).unwrap();
+    fs::write(
+        repo.root_path().join("untracked.txt"),
+        "untracked content\n",
+    )
+    .unwrap();
+    let permissions = fs::metadata(&git_dir).unwrap().permissions();
+    let read_only = fs::Permissions::from_mode(permissions.mode() & !0o222);
+    let restore = RestorePermissions(&git_dir, permissions);
+    fs::set_permissions(&git_dir, read_only).unwrap();
+
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .args(["step", "diff"])
+        .env("TMPDIR", scratch.path().join("missing"))
+        .output()
+        .unwrap();
+    drop(restore);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "diff unexpectedly succeeded");
+    assert!(
+        stderr.contains(
+            "Failed to create temporary index in the system temp directory or Git directory"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(real_index).unwrap(), before);
 }
 
 /// Explicit target branch
